@@ -47,6 +47,8 @@ trait FileSystem {
     fn open(&mut self, path: &str) -> Result<usize, FileSystemError>;
 
     fn close(&mut self, fd: usize) -> Result<(), FileSystemError>;
+
+    fn write(&mut self, fd: usize, data: &[u8]) -> Result<(), FileSystemError>;
 }
 
 struct SimpleFileSystem {
@@ -69,6 +71,13 @@ impl SimpleFileSystem {
         }
     }
 
+    fn get_file_descriptor(&self, fd: usize) -> Result<Arc<Mutex<INode>>, FileSystemError> {
+        self.file_descriptors
+            .get(&fd)
+            .map(|desc| desc.inode.clone())
+            .ok_or(FileSystemError::InvalidFileDescriptor)
+    }
+
     fn allocate_fd(&mut self, inode: Arc<Mutex<INode>>) -> usize {
         let fd = self.next_fd;
         self.next_fd += 1;
@@ -79,7 +88,6 @@ impl SimpleFileSystem {
     fn get_inode(&self, path: &str) -> Result<Arc<Mutex<INode>>, FileSystemError> {
         let components: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         let mut current = &self.root;
-
         for component in components.iter() {
             let component_str = component.to_string();
             if let INode::Folder { contents, .. } = current {
@@ -152,6 +160,20 @@ impl FileSystem for SimpleFileSystem {
             Err(FileSystemError::InvalidFileDescriptor)
         }
     }
+
+    fn write(&mut self, fd: usize, data: &[u8]) -> Result<(), FileSystemError> {
+        let inode = self.get_file_descriptor(fd)?;
+        let mut inode = inode.lock().unwrap();
+        if let INode::File {
+            data: file_data, ..
+        } = &mut *inode
+        {
+            file_data.extend_from_slice(data);
+            Ok(())
+        } else {
+            Err(FileSystemError::InvalidType)
+        }
+    }
 }
 
 // Function to mount the file system
@@ -167,6 +189,12 @@ fn main() {
     match fs.create("/new_file.txt", Permissions::ReadWrite) {
         Ok(fd) => {
             println!("File created successfully with file descriptor: {}", fd);
+
+            // Test writing to the file
+            match fs.write(fd, b"Hello, world!") {
+                Ok(()) => println!("Data written successfully."),
+                Err(e) => println!("Error writing data: {:?}", e),
+            }
 
             // Test opening the file
             match fs.open("/new_file.txt") {
