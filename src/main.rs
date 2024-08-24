@@ -73,7 +73,7 @@ impl FileSystem for SimpleFileSystem {
             }
         }
 
-        Err(FileSystemError::InvalidType) // If we get here, path parsing failed
+        Err(FileSystemError::InvalidType)
     }
 }
 
