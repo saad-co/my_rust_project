@@ -46,12 +46,34 @@ struct SimpleFileSystem {
 
 impl FileSystem for SimpleFileSystem {
     fn create(&mut self, path: &str, permissions_mode: Permissions) -> Result<usize, FileSystemError> {
-        // This is where we will implement the file creation logic
-        // For now, let's print the path and permissions to check the flow
-        println!("Creating file at path: {} with permissions: {:?}", path, permissions_mode);
+        let components: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        let mut current = &mut self.root;
 
-        // Temporary implementation, to be replaced with actual logic
-        Ok(1) // Placeholder file descriptor
+        for (i, component) in components.iter().enumerate() {
+            if let INode::Folder { contents, .. } = current {
+                if i == components.len() - 1 {
+                    // Last component, create the file or directory here
+                    if contents.contains_key(*component) {
+                        return Err(FileSystemError::FileExists);
+                    }
+                    contents.insert(component.to_string(), INode::File {
+                        data: Vec::new(),
+                        permissions: permissions_mode,
+                    });
+                    return Ok(1); // Placeholder file descriptor
+                } else {
+                    // Intermediate folder
+                    match contents.get_mut(*component) {
+                        Some(INode::Folder { .. }) => current = contents.get_mut(*component).unwrap(),
+                        _ => return Err(FileSystemError::InvalidType),
+                    }
+                }
+            } else {
+                return Err(FileSystemError::InvalidType);
+            }
+        }
+
+        Err(FileSystemError::InvalidType) // If we get here, path parsing failed
     }
 }
 
@@ -61,7 +83,6 @@ pub fn mount() -> Box<dyn FileSystem> {
         contents: HashMap::new(),
         permissions: Permissions::ReadWrite,
     };
-
     Box::new(SimpleFileSystem { root })
 }
 
