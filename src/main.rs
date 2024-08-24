@@ -31,6 +31,13 @@ enum FileSystemError {
     InvalidFileDescriptor,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum OffsetFrom {
+    Start(usize),
+    Current(isize),
+    End(isize),
+}
+
 // File Descriptor Table Entry
 #[derive(Debug)]
 struct FileDescriptor {
@@ -49,6 +56,8 @@ trait FileSystem {
     fn close(&mut self, fd: usize) -> Result<(), FileSystemError>;
 
     fn write(&mut self, fd: usize, data: &[u8]) -> Result<(), FileSystemError>;
+    fn read(&self, fd: usize, buffer: &mut [u8]) -> Result<usize, FileSystemError>;
+    fn seek(&mut self, fd: usize, position: OffsetFrom) -> Result<usize, FileSystemError>;
 }
 
 struct SimpleFileSystem {
@@ -174,13 +183,54 @@ impl FileSystem for SimpleFileSystem {
             Err(FileSystemError::InvalidType)
         }
     }
+    fn read(&self, fd: usize, buffer: &mut [u8]) -> Result<usize, FileSystemError> {
+        let inode = self.get_file_descriptor(fd)?;
+        let inode = inode.lock().unwrap();
+
+        if let INode::File {
+            data: file_data, ..
+        } = &*inode
+        {
+            let len = buffer.len().min(file_data.len());
+            buffer[..len].copy_from_slice(&file_data[..len]);
+            Ok(len)
+        } else {
+            Err(FileSystemError::InvalidType)
+        }
+    }
+    fn seek(&mut self, fd: usize, position: OffsetFrom) -> Result<usize, FileSystemError> {
+        let inode = self.get_file_descriptor(fd)?;
+        let mut inode = inode.lock().unwrap();
+
+        if let INode::File {
+            data: file_data, ..
+        } = &mut *inode
+        {
+            let new_position = match position {
+                OffsetFrom::Start(offset) => offset,
+                OffsetFrom::Current(offset) => {
+                    let current_position = file_data.len() as isize;
+                    (current_position + offset) as usize
+                }
+                OffsetFrom::End(offset) => {
+                    let end_position = file_data.len() as isize;
+                    (end_position + offset) as usize
+                }
+            };
+
+            // Ensure the new position is within valid bounds
+            let new_position = new_position.min(file_data.len());
+            Ok(new_position)
+        } else {
+            Err(FileSystemError::InvalidType)
+        }
+    }
 }
 
 // Function to mount the file system
 pub fn mount() -> Box<dyn FileSystem> {
     Box::new(SimpleFileSystem::new())
 }
-
 fn main() {
     let mut fs = mount();
     println!("File system mounted successfully!");
@@ -194,6 +244,12 @@ fn main() {
             match fs.write(fd, b"Hello, world!") {
                 Ok(()) => println!("Data written successfully."),
                 Err(e) => println!("Error writing data: {:?}", e),
+            }
+
+            // Test seeking to the start of the file
+            match fs.seek(fd, OffsetFrom::Start(5)) {
+                Ok(pos) => println!("Seeked to position: {}", pos),
+                Err(e) => println!("Error seeking file: {:?}", e),
             }
 
             // Test opening the file
