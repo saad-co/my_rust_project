@@ -42,6 +42,7 @@ enum OffsetFrom {
 #[derive(Debug)]
 struct FileDescriptor {
     inode: Arc<Mutex<INode>>,
+    position: usize,
 }
 
 trait FileSystem {
@@ -57,7 +58,7 @@ trait FileSystem {
 
     fn write(&mut self, fd: usize, data: &[u8]) -> Result<(), FileSystemError>;
     fn read(&self, fd: usize, buffer: &mut [u8]) -> Result<usize, FileSystemError>;
-    fn seek(&mut self, fd: usize, position: OffsetFrom) -> Result<usize, FileSystemError>;
+    fn seek(&mut self, fd: usize, offset: OffsetFrom) -> Result<usize, FileSystemError>;
 }
 
 struct SimpleFileSystem {
@@ -90,7 +91,7 @@ impl SimpleFileSystem {
     fn allocate_fd(&mut self, inode: Arc<Mutex<INode>>) -> usize {
         let fd = self.next_fd;
         self.next_fd += 1;
-        self.file_descriptors.insert(fd, FileDescriptor { inode });
+        self.file_descriptors.insert(fd, FileDescriptor { inode, position: 0 });
         fd
     }
 
@@ -171,59 +172,69 @@ impl FileSystem for SimpleFileSystem {
     }
 
     fn write(&mut self, fd: usize, data: &[u8]) -> Result<(), FileSystemError> {
-        let inode = self.get_file_descriptor(fd)?;
-        let mut inode = inode.lock().unwrap();
-        if let INode::File {
-            data: file_data, ..
-        } = &mut *inode
-        {
+        let mut file_desc = self.file_descriptors
+            .get_mut(&fd)
+            .ok_or(FileSystemError::InvalidFileDescriptor)?;
+
+        let mut inode = file_desc.inode.lock().unwrap();
+        if let INode::File { data: file_data, .. } = &mut *inode {
             file_data.extend_from_slice(data);
             Ok(())
         } else {
             Err(FileSystemError::InvalidType)
         }
     }
-    fn read(&self, fd: usize, buffer: &mut [u8]) -> Result<usize, FileSystemError> {
-        let inode = self.get_file_descriptor(fd)?;
-        let inode = inode.lock().unwrap();
 
-        if let INode::File {
-            data: file_data, ..
-        } = &*inode
-        {
-            let len = buffer.len().min(file_data.len());
-            buffer[..len].copy_from_slice(&file_data[..len]);
+    fn read(&self, fd: usize, buffer: &mut [u8]) -> Result<usize, FileSystemError> {
+        let file_desc = self.file_descriptors
+            .get(&fd)
+            .ok_or(FileSystemError::InvalidFileDescriptor)?;
+
+        let mut inode = file_desc.inode.lock().unwrap();
+        if let INode::File { data: file_data, .. } = &*inode {
+            let start = file_desc.position;
+            let end = start + buffer.len();
+            let len = end.min(file_data.len()) - start;
+            buffer[..len].copy_from_slice(&file_data[start..start + len]);
             Ok(len)
         } else {
             Err(FileSystemError::InvalidType)
         }
     }
-    fn seek(&mut self, fd: usize, position: OffsetFrom) -> Result<usize, FileSystemError> {
-        let inode = self.get_file_descriptor(fd)?;
-        let mut inode = inode.lock().unwrap();
 
-        if let INode::File {
-            data: file_data, ..
-        } = &mut *inode
-        {
-            let new_position = match position {
-                OffsetFrom::Start(offset) => offset,
-                OffsetFrom::Current(offset) => {
-                    let current_position = file_data.len() as isize;
-                    (current_position + offset) as usize
-                }
-                OffsetFrom::End(offset) => {
-                    let end_position = file_data.len() as isize;
-                    (end_position + offset) as usize
-                }
-            };
+    fn seek(&mut self, fd: usize, offset: OffsetFrom) -> Result<usize, FileSystemError> {
+        let mut file_desc = self
+            .file_descriptors
+            .get_mut(&fd)
+            .ok_or(FileSystemError::InvalidFileDescriptor)?;
 
-            // Ensure the new position is within valid bounds
-            let new_position = new_position.min(file_data.len());
-            Ok(new_position)
+        let inode = file_desc.inode.lock().unwrap();
+        let file_size = if let INode::File { data, .. } = &*inode {
+            data.len()
         } else {
-            Err(FileSystemError::InvalidType)
-        }
+            return Err(FileSystemError::InvalidType);
+        };
+
+        let new_position = match offset {
+            OffsetFrom::Start(pos) => pos,
+            OffsetFrom::Current(offset) => {
+                if let Some(pos) = file_desc.position.checked_add_signed(offset) {
+                    pos
+                } else {
+                    return Err(FileSystemError::InvalidType);
+                }
+            }
+            OffsetFrom::End(offset) => {
+                if let Some(pos) = file_size.checked_add_signed(offset) {
+                    pos
+                } else {
+                    return Err(FileSystemError::InvalidType);
+                }
+            }
+        };
+
+        file_desc.position = new_position.min(file_size);
+        Ok(file_desc.position)
     }
 }
 
@@ -231,6 +242,7 @@ impl FileSystem for SimpleFileSystem {
 pub fn mount() -> Box<dyn FileSystem> {
     Box::new(SimpleFileSystem::new())
 }
+
 fn main() {
     let mut fs = mount();
     println!("File system mounted successfully!");
@@ -247,23 +259,47 @@ fn main() {
             }
 
             // Test seeking to the start of the file
-            match fs.seek(fd, OffsetFrom::Start(5)) {
+            match fs.seek(fd, OffsetFrom::Start(0)) {
                 Ok(pos) => println!("Seeked to position: {}", pos),
                 Err(e) => println!("Error seeking file: {:?}", e),
             }
 
-            // Test opening the file
-            match fs.open("/new_file.txt") {
-                Ok(open_fd) => {
-                    println!("File opened successfully with file descriptor: {}", open_fd);
-
-                    // Test closing the file
-                    match fs.close(open_fd) {
-                        Ok(()) => println!("File closed successfully."),
-                        Err(e) => println!("Error closing file: {:?}", e),
-                    }
+            // Test reading from the file
+            let mut buffer = [0; 13];
+            match fs.read(fd, &mut buffer) {
+                Ok(bytes_read) => {
+                    println!(
+                        "Read {} bytes: {:?}",
+                        bytes_read,
+                        String::from_utf8_lossy(&buffer)
+                    );
                 }
-                Err(e) => println!("Error opening file: {:?}", e),
+                Err(e) => println!("Error reading data: {:?}", e),
+            }
+
+            // Test seeking to the end of the file
+            match fs.seek(fd, OffsetFrom::End(-6)) {
+                Ok(pos) => println!("Seeked to position: {}", pos),
+                Err(e) => println!("Error seeking file: {:?}", e),
+            }
+
+            // Test reading from the new position
+            let mut buffer = [0; 6];
+            match fs.read(fd, &mut buffer) {
+                Ok(bytes_read) => {
+                    println!(
+                        "Read {} bytes: {:?}",
+                        bytes_read,
+                        String::from_utf8_lossy(&buffer)
+                    );
+                }
+                Err(e) => println!("Error reading data: {:?}", e),
+            }
+
+            // Test closing the file
+            match fs.close(fd) {
+                Ok(()) => println!("File closed successfully."),
+                Err(e) => println!("Error closing file: {:?}", e),
             }
         }
         Err(e) => println!("Error creating file: {:?}", e),
