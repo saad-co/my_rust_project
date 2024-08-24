@@ -20,7 +20,6 @@ enum INode {
     },
 }
 
-// Error handling for file system operations
 #[derive(Debug)]
 enum FileSystemError {
     InvalidType,
@@ -38,7 +37,6 @@ enum OffsetFrom {
     End(isize),
 }
 
-// File Descriptor Table Entry
 #[derive(Debug)]
 struct FileDescriptor {
     inode: Arc<Mutex<INode>>,
@@ -61,6 +59,8 @@ trait FileSystem {
     fn seek(&mut self, fd: usize, offset: OffsetFrom) -> Result<usize, FileSystemError>;
     fn mkdir(&mut self, path: &str) -> Result<(), FileSystemError>;
     fn rmdir(&mut self, path: &str) -> Result<(), FileSystemError>;
+    // fn unlink(&mut self, path: &str) -> Result<(), FileSystemError>;
+    // fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), FileSystemError>;
 }
 
 struct SimpleFileSystem {
@@ -79,7 +79,7 @@ impl SimpleFileSystem {
         SimpleFileSystem {
             root,
             file_descriptors: HashMap::new(),
-            next_fd: 1, // Start file descriptors from 1
+            next_fd: 1,
         }
     }
 
@@ -113,100 +113,10 @@ impl SimpleFileSystem {
             }
         }
 
-        Ok(Arc::new(Mutex::new(current.clone())))
-    }
-
-    fn mkdir(&mut self, path: &str) -> Result<(), FileSystemError> {
-        let components: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-        let mut current = &mut self.root;
-
-        for (i, component) in components.iter().enumerate() {
-            let component_str = component.to_string();
-            if let INode::Folder {
-                contents,
-                permissions,
-            } = current
-            {
-                if i == components.len() - 1 {
-                    // We are at the last component
-                    if contents.contains_key(&component_str) {
-                        return Err(FileSystemError::FileExists);
-                    }
-                    if *permissions != Permissions::Write && *permissions != Permissions::ReadWrite
-                    {
-                        return Err(FileSystemError::PermissionDenied);
-                    }
-                    contents.insert(
-                        component_str.clone(),
-                        INode::Folder {
-                            contents: HashMap::new(),
-                            permissions: Permissions::ReadWrite,
-                        },
-                    );
-                    return Ok(());
-                } else {
-                    match contents.get_mut(&component_str) {
-                        Some(INode::Folder { .. }) => {
-                            current = contents.get_mut(&component_str).unwrap()
-                        }
-                        Some(INode::File { .. }) => return Err(FileSystemError::InvalidType),
-                        None => return Err(FileSystemError::FileNotFound),
-                    }
-                }
-            } else {
-                return Err(FileSystemError::InvalidType);
-            }
+        match current {
+            INode::File { .. } => Ok(Arc::new(Mutex::new(current.clone()))),
+            _ => Err(FileSystemError::InvalidType),
         }
-
-        Err(FileSystemError::InvalidType)
-    }
-
-    fn rmdir(&mut self, path: &str) -> Result<(), FileSystemError> {
-        let components: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-        let mut current = &mut self.root;
-
-        if components.is_empty() {
-            return Err(FileSystemError::FileNotFound);
-        }
-
-        for (i, component) in components.iter().enumerate() {
-            let component_str = component.to_string();
-
-            if let INode::Folder { contents, .. } = current {
-                if i == components.len() - 1 {
-                    // We are at the target directory
-                    if let Some(node) = contents.get(&component_str) {
-                        match node {
-                            INode::Folder {
-                                contents: folder_contents,
-                                ..
-                            } => {
-                                if folder_contents.is_empty() {
-                                    contents.remove(&component_str);
-                                    return Ok(());
-                                } else {
-                                    return Err(FileSystemError::DirectoryNotEmpty);
-                                }
-                            }
-                            _ => return Err(FileSystemError::InvalidType),
-                        }
-                    } else {
-                        return Err(FileSystemError::FileNotFound);
-                    }
-                } else {
-                    match contents.get_mut(&component_str) {
-                        Some(INode::Folder { .. }) => {
-                            current = contents.get_mut(&component_str).unwrap();
-                        }
-                        _ => return Err(FileSystemError::InvalidType),
-                    }
-                }
-            } else {
-                return Err(FileSystemError::InvalidType);
-            }
-        }
-
-        Err(FileSystemError::FileNotFound)
     }
 }
 
@@ -236,18 +146,14 @@ impl FileSystem for SimpleFileSystem {
                     let inode = Arc::new(Mutex::new(contents.get(&component_str).unwrap().clone()));
                     return Ok(self.allocate_fd(inode));
                 } else {
-                    match contents.get_mut(&component_str) {
-                        Some(INode::Folder { .. }) => {
-                            current = contents.get_mut(&component_str).unwrap()
-                        }
-                        _ => return Err(FileSystemError::InvalidType),
-                    }
+                    current = contents
+                        .get_mut(&component_str)
+                        .ok_or(FileSystemError::FileNotFound)?;
                 }
             } else {
                 return Err(FileSystemError::InvalidType);
             }
         }
-
         Err(FileSystemError::InvalidType)
     }
 
@@ -257,81 +163,64 @@ impl FileSystem for SimpleFileSystem {
     }
 
     fn close(&mut self, fd: usize) -> Result<(), FileSystemError> {
-        if self.file_descriptors.remove(&fd).is_some() {
-            Ok(())
-        } else {
-            Err(FileSystemError::InvalidFileDescriptor)
-        }
+        self.file_descriptors
+            .remove(&fd)
+            .map(|_| ())
+            .ok_or(FileSystemError::InvalidFileDescriptor)
     }
 
     fn write(&mut self, fd: usize, data: &[u8]) -> Result<(), FileSystemError> {
-        let mut file_desc = self
-            .file_descriptors
-            .get_mut(&fd)
-            .ok_or(FileSystemError::InvalidFileDescriptor)?;
+        let inode = self.get_file_descriptor(fd)?;
 
-        let mut inode = file_desc.inode.lock().unwrap();
-        if let INode::File {
-            data: file_data, ..
-        } = &mut *inode
-        {
-            file_data.extend_from_slice(data);
-            Ok(())
-        } else {
-            Err(FileSystemError::InvalidType)
+        let mut node = inode.lock().unwrap();
+        match &mut *node {
+            INode::File {
+                data: file_data, ..
+            } => {
+                file_data.extend_from_slice(data);
+                Ok(())
+            }
+            _ => Err(FileSystemError::InvalidType),
         }
     }
 
     fn read(&self, fd: usize, buffer: &mut [u8]) -> Result<usize, FileSystemError> {
-        let file_desc = self
-            .file_descriptors
-            .get(&fd)
-            .ok_or(FileSystemError::InvalidFileDescriptor)?;
+        let inode = self.get_file_descriptor(fd)?;
 
-        let inode = file_desc.inode.lock().unwrap();
-        if let INode::File { data, .. } = &*inode {
-            let len = data.len();
-            buffer.copy_from_slice(&data[0..len]);
-            Ok(len)
-        } else {
-            Err(FileSystemError::InvalidType)
+        let node = inode.lock().unwrap();
+        match &*node {
+            INode::File {
+                data: file_data, ..
+            } => {
+                let read_len = buffer.len().min(file_data.len());
+                buffer[..read_len].copy_from_slice(&file_data[..read_len]);
+                Ok(read_len)
+            }
+            _ => Err(FileSystemError::InvalidType),
         }
     }
 
     fn seek(&mut self, fd: usize, offset: OffsetFrom) -> Result<usize, FileSystemError> {
-        let file_desc = self
+        let descriptor = self
             .file_descriptors
             .get_mut(&fd)
             .ok_or(FileSystemError::InvalidFileDescriptor)?;
 
-        let inode = file_desc.inode.lock().unwrap();
-        if let INode::File { data, .. } = &*inode {
-            let new_pos = match offset {
-                OffsetFrom::Start(pos) => pos,
-                OffsetFrom::Current(delta) => {
-                    if delta < 0 {
-                        (file_desc.position as isize + delta) as usize
-                    } else {
-                        (file_desc.position as isize + delta) as usize
-                    }
+        let inode = descriptor.inode.lock().unwrap();
+        match &*inode {
+            INode::File { data, .. } => {
+                let new_position = match offset {
+                    OffsetFrom::Start(pos) => pos,
+                    OffsetFrom::Current(off) => (descriptor.position as isize + off) as usize,
+                    OffsetFrom::End(off) => (data.len() as isize + off) as usize,
+                };
+                if new_position > data.len() {
+                    return Err(FileSystemError::InvalidType);
                 }
-                OffsetFrom::End(delta) => {
-                    if delta < 0 {
-                        (data.len() as isize + delta) as usize
-                    } else {
-                        (data.len() as isize + delta) as usize
-                    }
-                }
-            };
-
-            if new_pos > data.len() {
-                return Err(FileSystemError::InvalidFileDescriptor);
+                descriptor.position = new_position;
+                Ok(descriptor.position)
             }
-
-            file_desc.position = new_pos;
-            Ok(new_pos)
-        } else {
-            Err(FileSystemError::InvalidType)
+            _ => Err(FileSystemError::InvalidType),
         }
     }
 
@@ -341,22 +230,13 @@ impl FileSystem for SimpleFileSystem {
 
         for (i, component) in components.iter().enumerate() {
             let component_str = component.to_string();
-            if let INode::Folder {
-                contents,
-                permissions,
-            } = current
-            {
+            if let INode::Folder { contents, .. } = current {
                 if i == components.len() - 1 {
-                    // We are at the last component
                     if contents.contains_key(&component_str) {
                         return Err(FileSystemError::FileExists);
                     }
-                    if *permissions != Permissions::Write && *permissions != Permissions::ReadWrite
-                    {
-                        return Err(FileSystemError::PermissionDenied);
-                    }
                     contents.insert(
-                        component_str.clone(),
+                        component_str,
                         INode::Folder {
                             contents: HashMap::new(),
                             permissions: Permissions::ReadWrite,
@@ -364,13 +244,9 @@ impl FileSystem for SimpleFileSystem {
                     );
                     return Ok(());
                 } else {
-                    match contents.get_mut(&component_str) {
-                        Some(INode::Folder { .. }) => {
-                            current = contents.get_mut(&component_str).unwrap()
-                        }
-                        Some(INode::File { .. }) => return Err(FileSystemError::InvalidType),
-                        None => return Err(FileSystemError::FileNotFound),
-                    }
+                    current = contents
+                        .get_mut(&component_str)
+                        .ok_or(FileSystemError::FileNotFound)?;
                 }
             } else {
                 return Err(FileSystemError::InvalidType);
@@ -427,60 +303,181 @@ impl FileSystem for SimpleFileSystem {
 
         Err(FileSystemError::FileNotFound)
     }
+
+    // fn unlink(&mut self, path: &str) -> Result<(), FileSystemError> {
+    //     let components: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    //     let mut current = &mut self.root;
+    //     let mut parent: Option<&mut HashMap<String, INode>> = None;
+    //     let mut component_name = String::new();
+
+    //     for (i, component) in components.iter().enumerate() {
+    //         let component_str = component.to_string();
+
+    //         if let INode::Folder { contents, .. } = current {
+    //             if i == components.len() - 1 {
+    //                 // We are at the target file
+    //                 if let Some(node) = contents.get(&component_str) {
+    //                     match node {
+    //                         INode::File { .. } => {
+    //                             component_name = component_str;
+    //                             parent = Some(contents);
+    //                         }
+    //                         _ => return Err(FileSystemError::InvalidType),
+    //                     }
+    //                 } else {
+    //                     return Err(FileSystemError::FileNotFound);
+    //                 }
+    //             } else {
+    //                 match contents.get_mut(&component_str) {
+    //                     Some(INode::Folder { .. }) => {
+    //                         current = contents.get_mut(&component_str).unwrap();
+    //                     }
+    //                     _ => return Err(FileSystemError::InvalidType),
+    //                 }
+    //             }
+    //         } else {
+    //             return Err(FileSystemError::InvalidType);
+    //         }
+    //     }
+
+    //     // If we found the parent and the file to delete, perform the deletion
+    //     if let Some(contents) = parent {
+    //         contents.remove(&component_name);
+    //         Ok(())
+    //     } else {
+    //         Err(FileSystemError::FileNotFound)
+    //     }
+    // }
+
+    //     fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), FileSystemError> {
+    //         let old_components: Vec<&str> = old_path.trim_start_matches('/').split('/').collect();
+    //         let new_components: Vec<&str> = new_path.trim_start_matches('/').split('/').collect();
+
+    //         if old_components.is_empty() || new_components.is_empty() {
+    //             return Err(FileSystemError::InvalidType);
+    //         }
+
+    //         let mut current = &mut self.root;
+    //         let mut parent: Option<&mut HashMap<String, INode>> = None;
+    //         let mut component_name = String::new();
+
+    //         for (i, component) in old_components.iter().enumerate() {
+    //             let component_str = component.to_string();
+
+    //             if let INode::Folder { contents, .. } = current {
+    //                 if i == old_components.len() - 1 {
+    //                     // We are at the target file or folder
+    //                     if contents.contains_key(&component_str) {
+    //                         component_name = component_str;
+    //                         parent = Some(contents);
+    //                     } else {
+    //                         return Err(FileSystemError::FileNotFound);
+    //                     }
+    //                 } else {
+    //                     match contents.get_mut(&component_str) {
+    //                         Some(INode::Folder { .. }) => {
+    //                             current = contents.get_mut(&component_str).unwrap();
+    //                         }
+    //                         _ => return Err(FileSystemError::InvalidType),
+    //                     }
+    //                 }
+    //             } else {
+    //                 return Err(FileSystemError::InvalidType);
+    //             }
+    //         }
+
+    //         // Move the file/folder to the new location
+    //         if let Some(contents) = parent {
+    //             let inode = contents.remove(&component_name).unwrap();
+    //             let mut new_current = &mut self.root;
+
+    //             for (i, component) in new_components.iter().enumerate() {
+    //                 let component_str = component.to_string();
+
+    //                 if let INode::Folder { contents, .. } = new_current {
+    //                     if i == new_components.len() - 1 {
+    //                         if contents.contains_key(&component_str) {
+    //                             return Err(FileSystemError::FileExists);
+    //                         } else {
+    //                             contents.insert(component_str, inode);
+    //                             return Ok(());
+    //                         }
+    //                     } else {
+    //                         match contents.get_mut(&component_str) {
+    //                             Some(INode::Folder { .. }) => {
+    //                                 new_current = contents.get_mut(&component_str).unwrap();
+    //                             }
+    //                             _ => return Err(FileSystemError::InvalidType),
+    //                         }
+    //                     }
+    //                 } else {
+    //                     return Err(FileSystemError::InvalidType);
+    //                 }
+    //             }
+    //         }
+    //         Err(FileSystemError::InvalidType)
+    //     }
 }
 
-// Function to mount the file system
-pub fn mount() -> Box<dyn FileSystem> {
-    Box::new(SimpleFileSystem::new())
+fn mount() -> SimpleFileSystem {
+    SimpleFileSystem::new()
 }
 
 fn main() {
     let mut fs = mount();
-    println!("File system mounted successfully!");
 
-    // Test creating a directory
-    match fs.mkdir("/dir_to_remove") {
-        Ok(()) => println!("Directory created successfully."),
-        Err(e) => println!("Error creating directory: {:?}", e),
+    // Create a new directory
+    match fs.mkdir("/my_folder") {
+        Ok(_) => println!("Directory '/my_folder' created successfully."),
+        Err(e) => println!("Failed to create directory: {:?}", e),
     }
 
-    // Test removing an empty directory
-    match fs.rmdir("/dir_to_remove") {
-        Ok(()) => println!("Directory removed successfully."),
-        Err(e) => println!("Error removing directory: {:?}", e),
+    // List the root directory (should contain "my_folder")
+    match fs.mkdir("/") {
+        Ok(_) => println!("Root directory listed successfully."),
+        Err(e) => println!("Failed to list root directory: {:?}", e),
     }
 
-    // Test removing a non-existing directory
-    match fs.rmdir("/non_existent_dir") {
-        Ok(()) => println!("Non-existent directory removed successfully (unexpected)."),
-        Err(e) => println!("Error removing non-existent directory: {:?}", e),
+    // Create a new file in the directory
+    match fs.create("/my_folder/my_file.txt", Permissions::ReadWrite) {
+        Ok(fd) => {
+            println!("File '/my_folder/my_file.txt' created successfully with fd: {}", fd);
+
+            // Write data to the file
+            let data = b"Hello, World!";
+            match fs.write(fd, data) {
+                Ok(_) => println!("Data written to '/my_folder/my_file.txt' successfully."),
+                Err(e) => println!("Failed to write data: {:?}", e),
+            }
+
+            // Seek to the beginning of the file
+            match fs.seek(fd, OffsetFrom::Start(0)) {
+                Ok(pos) => println!("Seek successful. New position: {}", pos),
+                Err(e) => println!("Failed to seek: {:?}", e),
+            }
+
+            // Read data from the file
+            let mut buffer = vec![0; data.len()];
+            match fs.read(fd, &mut buffer) {
+                Ok(bytes_read) => println!(
+                    "Data read from '/my_folder/my_file.txt': {}",
+                    String::from_utf8_lossy(&buffer[..bytes_read])
+                ),
+                Err(e) => println!("Failed to read data: {:?}", e),
+            }
+
+            // Close the file
+            match fs.close(fd) {
+                Ok(_) => println!("File '/my_folder/my_file.txt' closed successfully."),
+                Err(e) => println!("Failed to close file: {:?}", e),
+            }
+        }
+        Err(e) => println!("Failed to create file: {:?}", e),
     }
 
-    // Recreate the directory and add a nested directory
-    match fs.mkdir("/dir_to_remove") {
-        Ok(()) => println!("Directory created successfully."),
-        Err(e) => println!("Error creating directory: {:?}", e),
-    }
-
-    match fs.mkdir("/dir_to_remove/nested_dir") {
-        Ok(()) => println!("Nested directory created successfully."),
-        Err(e) => println!("Error creating nested directory: {:?}", e),
-    }
-
-    // Test removing a non-empty directory
-    match fs.rmdir("/dir_to_remove") {
-        Ok(()) => println!("Non-empty directory removed successfully (unexpected)."),
-        Err(e) => println!("Error removing non-empty directory: {:?}", e),
-    }
-
-    // Test removing the nested directory first, then the parent
-    match fs.rmdir("/dir_to_remove/nested_dir") {
-        Ok(()) => println!("Nested directory removed successfully."),
-        Err(e) => println!("Error removing nested directory: {:?}", e),
-    }
-
-    match fs.rmdir("/dir_to_remove") {
-        Ok(()) => println!("Parent directory removed successfully."),
-        Err(e) => println!("Error removing parent directory: {:?}", e),
+    // Remove the empty directory
+    match fs.rmdir("/my_folder") {
+        Ok(_) => println!("Directory '/my_folder' removed successfully."),
+        Err(e) => println!("Failed to remove directory: {:?}", e),
     }
 }
